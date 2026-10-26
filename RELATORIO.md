@@ -23,7 +23,7 @@ Abaixo está o mapeamento detalhado dos problemas estruturais identificados no c
 
 ## 2. Registro da Refatoração por Etapas
 
-### Tópico 1: Eliminação de Primitive Obsession e Imutabilidade (Concluído)
+### Tópico 1: Eliminação de Primitive Obsession e Imutabilidade (Concluído — Commit 2)
 
 #### 1. Criação do Value Object `Money`
 * **Implementação:** Desenvolvido como um `record` imutável em Java (`Money.java`).
@@ -36,8 +36,8 @@ Abaixo está o mapeamento detalhado dos problemas estruturais identificados no c
 #### 2. Criação do Command / Parameter Object `BillingCommand`
 * **Implementação:** Desenvolvido como um `record` em Java (`BillingCommand.java`).
 * **Responsabilidades Encapsuladas:**
-  * Reúne os parâmetros de entrada: `customerId`, `planType`, `basePrice` (agora fortemente tipado como `Money`), `signupDateStr`, `overdueDays`, `promoCode`, `isNonProfit` e `paymentCardToken`.
-  * Validações de não-nulidade na construção para garantir consistência.
+  * Reúne os parâmetros de entrada: `customerId`, `planType`, `basePrice` (fortemente tipado como `Money`), `signupDateStr`, `overdueDays`, `promoCode`, `isNonProfit` e `paymentCardToken`.
+  * Validações de não-nulidade na construção (`Objects.requireNonNull`) para garantir consistência de domínio.
   * Construtor de conveniência aceitando `double basePrice` para manter compatibilidade e facilitar a transição.
 
 #### 3. Ajuste em `SubscriptionBillingService`
@@ -47,15 +47,62 @@ Abaixo está o mapeamento detalhado dos problemas estruturais identificados no c
 
 ---
 
+### Tópico 2: Inversão de Dependência e Desacoplamento de I/O (Concluído — Commit 3)
+
+#### 1. Extração de Interfaces de Infraestrutura (Portas)
+* **`CustomerRepository` (`CustomerRepository.java`):** Abstrai o acesso a dados de clientes e faturas com os métodos `Optional<Customer> findById(String customerId)` e `void saveInvoice(String customerId, Money amount, String status, LocalDate createdAt)`, além do `record Customer(String email, String status)`. Remove completamente o acoplamento direto com `java.sql.*`, queries SQL hardcoded e credenciais estáticas (`DB_URL`, `DB_USER`, `DB_PASS`).
+* **`PaymentGateway` (`PaymentGateway.java`):** Define o contrato `boolean processPayment(String paymentCardToken, Money amount)`, isolando a lógica e integração de cobrança via cartão.
+* **`NotificationService` (`NotificationService.java`):** Define o contrato `void sendInvoice(String email, Money amount)`, eliminando a instanciação direta de `org.apache.commons.mail.SimpleEmail` e configurações de servidor SMTP do núcleo de negócio.
+
+#### 2. Injeção de Dependência e Determinismo Temporal (`java.time.Clock`)
+* `SubscriptionBillingService` passou a receber `CustomerRepository`, `PaymentGateway`, `NotificationService` e `Clock` via construtor.
+* A chamada estática `LocalDate.now()` foi substituída por `LocalDate.now(clock)`, permitindo que os testes na esteira de CI/CD fixem qualquer data (`Clock.fixed(...)`) para validar cenários sazonais (como a promoção `BLACKFRIDAY` no mês 11 e o cálculo de meses ativos) de maneira 100% determinística e sem depender de banco de dados ou servidor SMTP.
+
+---
+
+### Tópico 3: Extração de Classes e Métodos (Concluído — Commit 4)
+
+#### 1. Isolamento das Regras Matemáticas em `PricingCalculator`
+* Criada a classe de domínio pura `PricingCalculator` (`PricingCalculator.java`), completamente livre de efeitos colaterais de rede, banco de dados ou I/O.
+* O método principal `Money calculate(BillingCommand command, LocalDate today)` foi decomposto em métodos privados coesos e de responsabilidade única:
+  * `calculateMonthsActive(LocalDate signupDate, LocalDate today)`: calcula o tempo de fidelidade do cliente em meses.
+  * `applyPromoCode(Money price, BillingCommand command, LocalDate today, int monthsActive)`: aplica regras de cupons promocionais (`BLACKFRIDAY` e `WELCOME10`) com cláusulas de guarda (*Guard Clauses*).
+  * `applyLatePaymentCharges(Money price, int overdueDays)`: calcula multa de 2% e juros compostos/diários de 0,1% ao dia em caso de atraso.
+
+#### 2. Redução da Complexidade Ciclomática no Orquestrador
+* Em `SubscriptionBillingService`, o método `processMonthlyBilling(BillingCommand command)` foi reduzido a uma fachada de alto nível com apenas **7 linhas**, delegando o cálculo de preço ao `PricingCalculator` e o fluxo de cobrança/persistência/notificação aos métodos auxiliares `processCustomerBilling(...)` e `addPaymentLog(...)`.
+* Adicionado construtor sobrecarregado permitindo tanto instanciar `PricingCalculator` por padrão quanto injetá-lo explicitamente.
+
+---
+
+### Tópico 4: Remoção de Código Morto e Limpeza de Erros Mascarados (Concluído — Commit 4)
+
+* **Remoção de Código Morto (*Dead Code*):** A linha comentada `// emailSender.send();` herdada do código legado foi eliminada.
+* **Eliminação de *Swallowed Exceptions* (`catch (Exception e)`):** O bloco `try / catch (Exception e)` genérico que engolia falhas de infraestrutura foi removido. Agora, o fluxo utiliza `Optional<CustomerRepository.Customer>` com cláusulas de guarda (`if (customer.isEmpty()) return;`), permitindo que eventuais falhas reais de infraestrutura não sejam silenciosamente mascaradas.
+
+---
+
+## 3. Histórico Estruturado no Git
+
+O repositório registra a evolução incremental da refatoração nos seguintes commits:
+
+1. **`21e7d11` — Commit 1:** Adição do código legado base (`SubscriptionBillingService-pratica.java`).
+2. **`82d2a3b` — Commit 2:** Introdução dos Value Objects (`Money`, `BillingCommand`) e remoção de *Primitive Obsession*.
+3. **`78c6051` — Commit 3:** Extração das interfaces de infraestrutura (`CustomerRepository`, `PaymentGateway`, `NotificationService`) e injeção de dependência (incluindo `Clock`).
+4. **`125891f` — Commit 4:** Refatoração do motor de precificação (`PricingCalculator`), limpeza de código morto/exceções mascaradas e simplificação do método orquestrador.
+
+---
+
 ## 4. Tabela Comparativa de Métricas (Antes vs. Depois)
 
-| Métrica / Dimensão Analisada | Antes da Refatoração (Legado) | Depois do Tópico 1 | Status Final Previsto (Pós Tópicos 2, 3 e 4) |
-|------------------------------|-------------------------------|--------------------|----------------------------------------------|
-| **Número de parâmetros do método orquestrador** | 8 parâmetros soltos (Strings, doubles, ints, booleans) | **1 parâmetro** (`BillingCommand`) | 1 parâmetro (`BillingCommand`) |
-| **Tipo representativo de moeda/valores financeiros** | `double` primitivo sujeito a erros de precisão IEEE 754 | **Value Object imutável `Money`** (`BigDecimal` escala 2, `HALF_UP`) | Value Object `Money` |
-| **Encapsulamento de operações financeiras** | Disperso em expressões aritméticas (`* 0.15`, `- 30.0`, etc.) | **Centralizado em `Money`** (`.percentage()`, `.subtract()`, etc.) | Centralizado em `Money` |
-| **Acoplamento com I/O no fluxo de faturamento** | Acoplamento rígido direto a PostgreSQL e SMTP | Mantido temporariamente (aguardando Tópico 2) | Desacoplado via interfaces (`CustomerRepository`, `PaymentGateway`, `NotificationService`) |
-| **Determinismo temporal de testes** | Indeterminado (dependente de `LocalDate.now()`) | Mantido temporariamente (aguardando Tópico 2) | 100% determinístico via `Clock` injetado |
-| **Complexidade ciclomática e tamanho do orquestrador** | Monólito com ~88 linhas de método | ~85 linhas (lógica de cálculo mantida in-line) | Fachada de alto nível com no máximo 25 linhas |
-| **Tratamento de exceções** | Genérico (`catch (Exception e)`) mascarando erros | Mantido temporariamente (aguardando Tópico 4) | Tratamento especializado e propagação correta |
+| Métrica / Dimensão Analisada | Antes da Refatoração (Código Legado) | Depois da Refatoração (Estado Final) | Ganho Obtido na Manutenibilidade e CI/CD |
+|------------------------------|--------------------------------------|--------------------------------------|------------------------------------------|
+| **Número de parâmetros do método principal** | 8 parâmetros primitivos/Strings soltos | **1 parâmetro** (`BillingCommand`) | Elimina risco de troca acidental de parâmetros e facilita evolução do contrato. |
+| **Tipo representativo de valores financeiros** | `double` primitivo (sujeito a imprecisão IEEE 754) | **Value Object imutável `Money`** (`BigDecimal`, escala 2, `HALF_UP`) | Precisão contábil exata e imutabilidade garantida em todas as etapas do cálculo. |
+| **Encapsulamento das regras de precificação** | Embutido junto a código SQL e envio de e-mail | **Isolado na classe pura `PricingCalculator`** | Permite testar todas as regras matemáticas em milissegundos, sem mocks de infraestrutura. |
+| **Tamanho do método orquestrador (`processMonthlyBilling`)** | ~88 linhas em bloco monolítico único | **7 linhas** (fachada de alto nível; meta era ≤ 25 linhas) | Leitura imediata do fluxo de negócio e separação clara entre cálculo e efeitos colaterais. |
+| **Complexidade Ciclomática de `processMonthlyBilling`** | ~18 (múltiplos `if/else`, `try/catch` e operadores lógicos aninhados) | **1** no método orquestrador (e ≤ 4 nos métodos auxiliares extraídos) | Redução drástica de caminhos de execução por método e facilidade na cobertura de testes. |
+| **Acoplamento com infraestrutura (Banco e E-mail)** | Alto: `DriverManager.getConnection` (PostgreSQL) e `new SimpleEmail()` (SMTP) | **Zero acoplamento direto** (uso das portas `CustomerRepository`, `PaymentGateway` e `NotificationService`) | A esteira de CI executa 100% dos testes unitários em memória, sem depender de serviços externos. |
+| **Determinismo temporal** | Não determinístico (`LocalDate.now()` estático) | **100% determinístico** via injeção de `java.time.Clock` | Testes de promoções sazonais (`BLACKFRIDAY`) e tempo de assinatura tornam-se reproduzíveis em qualquer data. |
+| **Tratamento de erros e limpeza de código** | `catch (Exception e)` mascarando falhas + código comentado (`// emailSender.send()`) | **Sem blocos `catch` genéricos** e **sem código morto** | Falhas não são mais silenciadas e o código fica limpo de artefatos obsoletos. |
 
